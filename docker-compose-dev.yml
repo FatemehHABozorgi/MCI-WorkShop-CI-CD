@@ -1,0 +1,11 @@
+version: "3.7"
+services:
+  app:
+    image: "dkr.gas.mci.ir/dev/sample-devops-stage:latest"
+    environment:
+      - DEBUG=true
+      - TZ=Asia/Tehran
+    ports:
+      - "10.19.143.68:8000:8000"
+    restart: unless-stopped
+

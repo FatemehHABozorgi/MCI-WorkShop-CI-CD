@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  app-prod:
+    image: ${REGISTRY_URL}/prod/sample-devops-master:${v_less_tag:-latest}
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=production
+    deploy:
+      replicas: 2
+      # ============================================================
+      # ROLLING UPDATE — deploys new version one replica at a time.
+      # This ensures zero downtime during deploys.
+      # ============================================================
+      update_config:
+        parallelism: 1          # Update 1 replica at a time
+        delay: 10s              # Wait 10s between each replica update
+        failure_action: rollback # If a replica fails to start, rollback automatically
+        monitor: 30s            # Monitor each replica for 30s after start before proceeding
+        order: start-first      # Start the new replica before stopping the old one
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+        failure_action: pause   # If rollback itself fails, pause and alert — don't loop
+        order: start-first
+      restart_policy:
+        condition: on-failure
+      placement:
+        constraints:
+          - "node.hostname == gas-deploy09"
+

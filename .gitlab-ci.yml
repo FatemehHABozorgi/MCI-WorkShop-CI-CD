@@ -1,0 +1,243 @@
+##Sample DevOps Project
+
+stages:
+  - Build
+  - Test
+  - Review
+  - Release
+  - Deploy
+  - Verify
+
+variables:
+  GIT_STRATEGY: clone
+  GIT_DEPTH: 0
+  DOCKER_BUILDKIT: "1"
+
+# ============================================================
+# STAGING PIPELINE (stage branch)
+# ============================================================
+
+build-dev-job:
+  stage: Build
+  before_script:
+    - cp /data/users/appuser/sample-devops/.env .
+  script:
+    - docker image build
+        --cache-from "$REGISTRY_URL/dev/sample-devops-stage:latest"
+        -t "$REGISTRY_URL/dev/sample-devops-stage:$CI_COMMIT_SHORT_SHA"
+        -t "$REGISTRY_URL/dev/sample-devops-stage:latest"
+        .
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "stage"'
+  tags:
+    - stage
+
+test-job:
+  stage: Test
+  before_script:
+    - echo "Preparing unittest ..."
+    - docker run -d
+        --name sample-devops-stage-$CI_PIPELINE_IID
+        "$REGISTRY_URL/dev/sample-devops-stage:$CI_COMMIT_SHORT_SHA"
+  script:
+    - docker exec -w /app sample-devops-stage-$CI_PIPELINE_IID sh -c
+        "pytest --cov=app --tb=short -v --cov-append --disable-warnings --junit-xml=junit.xml --cov-report=xml || true"
+  coverage: '/^TOTAL\s+.*\s+(\d+\%)$/'
+  after_script:
+    - docker cp sample-devops-stage-$CI_PIPELINE_IID:/app/junit.xml ./junit.xml || true
+    - docker cp sample-devops-stage-$CI_PIPELINE_IID:/app/coverage.xml ./coverage.xml || true
+    - echo "Running unittests is done..."
+    - docker stop sample-devops-stage-$CI_PIPELINE_IID || true
+    - docker rm sample-devops-stage-$CI_PIPELINE_IID || true
+  # Tests should FAIL the pipeline if they fail — this is a critical gate.
+  artifacts:
+    when: always
+    reports:
+      junit:
+        - junit.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "stage"'
+  tags:
+    - stage
+
+review-dev-job:
+  stage: Review
+  script:
+    - $SONAR_PATH
+        -Dsonar.projectKey=Sample-DevOps-Stage
+        -Dsonar.sources=.
+        -Dsonar.host.url="$SONAR_URL"
+        -Dsonar.login="$SONAR_LOGIN"
+        -Dsonar.password="$SONAR_PASSWORD"
+        -Dsonar.qualitygate.wait=true
+        -Dsonar.qualitygate.timeout=300
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "stage"'
+  tags:
+    - stage
+
+release-dev-job:
+  stage: Release
+  before_script:
+    - docker login -u $REGISTRY_USER -p $REGISTRY_PASSWORD $REGISTRY_URL
+  script:
+    - docker push "$REGISTRY_URL/dev/sample-devops-stage:$CI_COMMIT_SHORT_SHA"
+    - docker push "$REGISTRY_URL/dev/sample-devops-stage:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "stage"'
+  tags:
+    - stage
+
+deploy-dev-job:
+  stage: Deploy
+  script:
+    - docker compose -f ./docker-compose-dev.yml up -d --remove-orphans
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "stage"'
+  tags:
+    - stage
+
+# ============================================================
+# STAGING SMOKE TEST (runs after deploy)
+# ============================================================
+
+smoke-test-stage:
+  stage: Verify
+  script:
+    # Wait for the service to be ready, then hit the health endpoint
+    - |
+      echo "Running smoke test on staging..."
+      MAX_RETRIES=10
+      RETRY_DELAY=5
+      for i in $(seq 1 $MAX_RETRIES); do
+        echo "Attempt $i/$MAX_RETRIES..."
+        if curl -sf --max-time 5 http://localhost:8000/health; then
+          echo "Smoke test PASSED"
+          exit 0
+        fi
+        echo "Service not ready yet, waiting ${RETRY_DELAY}s..."
+        sleep $RETRY_DELAY
+      done
+      echo "Smoke test FAILED — service did not become healthy in time"
+      exit 1
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "stage"'
+  tags:
+    - stage
+
+# ============================================================
+# PRODUCTION PIPELINE (master branch)
+# ============================================================
+
+
+build-prod-job:
+  stage: Build
+  before_script:
+    - cp /data/users/appuser/sample-devops/.env .
+    - |
+      if [ -z "$v_less_tag" ]; then
+        echo "ERROR: v_less_tag is empty! Using fallback version."
+        export v_less_tag="1.0.0"
+      fi
+      echo "Building with version ${v_less_tag}"
+  script:
+    - docker image build
+        --cache-from "$REGISTRY_URL/prod/sample-devops-master:latest"
+        -t "$REGISTRY_URL/prod/sample-devops-master:$v_less_tag"
+        .
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  tags:
+    - prod
+
+release-prod-job:
+  stage: Release
+  needs:
+    - job: build-prod-job
+      artifacts: true
+  before_script:
+    - docker login -u $REGISTRY_USER -p $REGISTRY_PASSWORD $REGISTRY_URL
+    - |
+      if [ -z "$v_less_tag" ]; then
+        echo "ERROR: v_less_tag is empty! Using fallback version."
+        export v_less_tag="1.0.0"
+      fi
+  script:
+    - echo "Releasing version $v_less_tag"
+    - appMajorVersion=$(echo "$v_less_tag" | cut -d'.' -f1)
+    - appMinorVersion=$(echo "$v_less_tag" | cut -d'.' -f2)
+
+    # Tag all variants
+    - docker tag "$REGISTRY_URL/prod/sample-devops-master:$v_less_tag" "$REGISTRY_URL/prod/sample-devops-master:latest"
+    - docker tag "$REGISTRY_URL/prod/sample-devops-master:$v_less_tag" "$REGISTRY_URL/prod/sample-devops-master:$CI_COMMIT_SHORT_SHA"
+    - docker tag "$REGISTRY_URL/prod/sample-devops-master:$v_less_tag" "$REGISTRY_URL/prod/sample-devops-master:$appMajorVersion"
+    - docker tag "$REGISTRY_URL/prod/sample-devops-master:$v_less_tag" "$REGISTRY_URL/prod/sample-devops-master:$appMajorVersion.$appMinorVersion"
+
+    # Push all tags
+    - docker push "$REGISTRY_URL/prod/sample-devops-master:$v_less_tag"
+    - docker push "$REGISTRY_URL/prod/sample-devops-master:$CI_COMMIT_SHORT_SHA"
+    - docker push "$REGISTRY_URL/prod/sample-devops-master:latest"
+    - docker push "$REGISTRY_URL/prod/sample-devops-master:$appMajorVersion"
+    - docker push "$REGISTRY_URL/prod/sample-devops-master:$appMajorVersion.$appMinorVersion"
+
+    # Cleanup local tags to free runner disk space
+    - docker rmi "$REGISTRY_URL/prod/sample-devops-master:$CI_COMMIT_SHORT_SHA" || true
+    - docker rmi "$REGISTRY_URL/prod/sample-devops-master:$appMajorVersion" || true
+    - docker rmi "$REGISTRY_URL/prod/sample-devops-master:$appMajorVersion.$appMinorVersion" || true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  tags:
+    - prod
+
+# ============================================================
+# PRODUCTION DEPLOY with manual approval gate
+# ============================================================
+
+deploy-prod-job:
+  stage: Deploy
+  needs:
+    - job: release-prod-job
+  script:
+    - |
+      echo "Deploying version ${v_less_tag} to production via Docker Swarm..."
+      docker stack deploy -c ./docker-compose-prod.yml sample-devops-prod --with-registry-auth
+  # ADDED: --with-registry-auth — required when Swarm nodes pull from a private registry.
+  # ADDED: when: manual — requires a human to click "Play" before deploying to production.
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+      when: manual
+      allow_failure: false
+  tags:
+    - prod
+
+# ============================================================
+# PRODUCTION SMOKE TEST
+# ============================================================
+
+smoke-test-prod:
+  stage: Verify
+  needs:
+    - job: deploy-prod-job
+  script:
+    - |
+      echo "Running smoke test on production..."
+      MAX_RETRIES=15
+      RETRY_DELAY=10
+      for i in $(seq 1 $MAX_RETRIES); do
+        echo "Attempt $i/$MAX_RETRIES..."
+        if curl -sf --max-time 5 http://localhost:8000/health; then
+          echo "Production smoke test PASSED"
+          exit 0
+        fi
+        echo "Service not ready yet, waiting ${RETRY_DELAY}s..."
+        sleep $RETRY_DELAY
+      done
+      echo "Production smoke test FAILED — initiating rollback..."
+      # AUTOMATIC ROLLBACK: If smoke test fails, roll back to the previous stable version
+      docker service rollback sample-devops-prod_app-prod
+      exit 1
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master"'
+  tags:
+    - prod
+
